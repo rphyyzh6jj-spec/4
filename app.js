@@ -125,7 +125,10 @@ function processPrices(rows, items, p, nowMs, st = {}) {
   for (const r of rows) {
     inc('rows');
     const buy = r.buy_price_max || 0, sell = r.sell_price_min || 0;
-    if (buy <= 0 || sell <= 0) { inc('noPrice'); continue; }
+    if (buy <= 0 || sell <= 0) {
+      inc(buy <= 0 && sell <= 0 ? 'noData' : sell <= 0 ? 'noSell' : 'noBuy');
+      continue;
+    }
     const f = calcFlip(buy, sell, p.premium);
     if (sell - buy < 3 || f.profit <= 0) { inc('loss'); continue; }
     const age = ageMin(nowMs, r.buy_price_max_date, r.sell_price_min_date);
@@ -149,7 +152,9 @@ function funnelText(st, p) {
   const n = k => st[k] || 0;
   return [
     `Предметов под фильтры: ${n('items')}, цены пришли по: ${n('rows')}`,
-    `Нет цены покупки или продажи: ${n('noPrice')}`,
+    `Нет ни покупки, ни продажи (пусто): ${n('noData')}`,
+    `Есть покупка, нет продажи: ${n('noSell')}`,
+    `Есть продажа, нет покупки: ${n('noBuy')}`,
     `Спред слишком мал (убыток после налога): ${n('loss')}`,
     `Прибыльно, но данные старше ${p.maxage} мин: ${n('stale')}`,
     `ROI ниже ${p.minroi}%: ${n('roiLow')}, выше ${p.maxroi}%: ${n('roiHigh')}`,
