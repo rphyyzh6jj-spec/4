@@ -178,6 +178,168 @@ function sumVolumes(entries, vols, nowMs) {
   return vols;
 }
 
+/* ---------- маршруты между городами ---------- */
+
+/* ОЦЕНКА риска и длины пути (1..3), а не данные с карты. Правится здесь.
+   Известно из гайдов: вокруг Caerleon красные зоны (полный лут), между королевскими городами дороги безопаснее.
+   Остальное (особенно Brecilien и длина путей) — грубое допущение.
+   Свои значения: ROUTE_OVERRIDES['Bridgewatch|Martlock'] = { risk: 1, travel: 1 }  (два города по алфавиту) */
+const ROUTE_OVERRIDES = {};
+function routeMeta(a, b) {
+  const key = [a, b].sort().join('|');
+  if (ROUTE_OVERRIDES[key]) return ROUTE_OVERRIDES[key];
+  if (a === 'Caerleon' || b === 'Caerleon') return { risk: 3, travel: 1 };
+  if (a === 'Brecilien' || b === 'Brecilien') return { risk: 2, travel: 3 };
+  return { risk: 1, travel: 2 };
+}
+
+const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '');
+
+/* Покупаем по ордеру на продажу в городе A (без сбора), продаём в городе B:
+   instant — сразу в чужую заявку на покупку (только налог), order — своим ордером (налог + сбор 2.5%). */
+function findOpps(rows, items, p, nowMs, st = {}) {
+  const inc = k => { st[k] = (st[k] || 0) + 1; };
+  const tax = p.premium ? 0.04 : 0.08;
+  const byItem = {};
+  for (const r of rows) {
+    const c = CITIES.find(x => norm(x) === norm(r.city));
+    if (c) (byItem[r.item_id] = byItem[r.item_id] || {})[c] = r;
+  }
+  const out = [];
+  for (const [id, cities] of Object.entries(byItem)) {
+    for (const a of CITIES) {
+      const ra = cities[a];
+      const buy = (ra && ra.sell_price_min) || 0;
+      if (buy <= 0) continue;
+      for (const b of CITIES) {
+        if (b === a || !cities[b]) continue;
+        const rb = cities[b];
+        const bBuy = rb.buy_price_max || 0, bSell = rb.sell_price_min || 0;
+        if (bBuy <= 0 && bSell <= 0) continue;
+        inc('pairs');
+        const cand = [];
+        if (bBuy > 0) cand.push({ mode: 'instant', price: bBuy, profit: bBuy * (1 - tax) - buy, date: rb.buy_price_max_date });
+        if (bSell > 1) cand.push({ mode: 'order', price: bSell - 1, profit: (bSell - 1) * (1 - tax - SETUP_FEE) - buy, date: rb.sell_price_min_date });
+        const prof = cand.filter(m => m.profit > 0);
+        if (!prof.length) { inc('loss'); continue; }
+        const fresh = [];
+        for (const m of prof) {
+          const age = ageMin(nowMs, ra.sell_price_min_date, m.date);
+          if (age !== null && age <= p.maxage) { m.age = age; fresh.push(m); }
+        }
+        if (!fresh.length) { inc('stale'); continue; }
+        const ok = [];
+        for (const m of fresh) {
+          m.roi = (m.profit / buy) * 100;
+          if (m.roi >= p.minroi && m.roi <= p.maxroi) ok.push(m);
+        }
+        if (!ok.length) { inc(fresh.every(m => m.roi < p.minroi) ? 'roiLow' : 'roiHigh'); continue; }
+        inc('ok');
+        const [t, e] = tierEnchant(id);
+        const modes = {};
+        for (const m of ok) modes[m.mode] = { price: m.price, profit: m.profit, roi: m.roi, age: Math.round(m.age) };
+        out.push({ id, name: items[id] || id, tier: `T${t}.${e}`, from: a, to: b, buy, modes });
+      }
+    }
+  }
+  return out;
+}
+
+function pickMode(o, variant) {
+  const I = o.modes.instant, O = o.modes.order;
+  if (variant === 'instant') return I ? { mode: 'instant', ...I } : null;
+  if (I && (!O || I.profit >= O.profit)) return { mode: 'instant', ...I };
+  return O ? { mode: 'order', ...O } : null;
+}
+
+/* Чтобы не запрашивать объёмы по десяткам тысяч пар: по каждому маршруту берём лучшие perRoute вариантов */
+function candidateOpps(opps, p, perRoute = 40) {
+  const groups = {};
+  for (const o of opps) (groups[o.from + '|' + o.to] = groups[o.from + '|' + o.to] || []).push(o);
+  const out = [];
+  for (const g of Object.values(groups)) {
+    const score = o => Math.max(...Object.values(o.modes).map(m => m.profit)) * Math.max(1, Math.floor(p.budget / o.buy));
+    g.sort((x, y) => score(y) - score(x));
+    out.push(...g.slice(0, perRoute));
+  }
+  return out;
+}
+
+function sumVolumesByCity(entries, vols, nowMs) {
+  const cutoff = nowMs - 24 * 3600 * 1000;
+  for (const e of entries) {
+    let s = 0;
+    for (const pt of e.data || []) {
+      const ts = Date.parse((pt.timestamp || '').slice(0, 19) + 'Z');
+      if (!isNaN(ts) && ts >= cutoff) s += pt.item_count || 0;
+    }
+    const k = e.item_id + '|' + norm(e.location);
+    vols[k] = (vols[k] || 0) + s;
+  }
+  return vols;
+}
+
+function buildBasket(group, vols, p, variant, st) {
+  const lines = [];
+  for (const o of group) {
+    const m = pickMode(o, variant);
+    if (!m) continue;
+    const vol = vols[o.id + '|' + norm(o.to)] || 0;
+    if (vol < p.minvol) { if (st && variant === 'best') st.lowVol = (st.lowVol || 0) + 1; continue; }
+    const maxQty = Math.min(Math.floor(p.budget / o.buy), vol);
+    if (maxQty < 1) continue;
+    lines.push({ o, m, vol, maxQty, ratio: m.profit / o.buy });
+  }
+  lines.sort((x, y) => y.ratio - x.ratio);
+  let left = p.budget, cost = 0, profit = 0;
+  const items = [];
+  for (const l of lines) {
+    const q = Math.min(l.maxQty, Math.floor(left / l.o.buy));
+    if (q < 1) continue;
+    left -= q * l.o.buy; cost += q * l.o.buy; profit += q * l.m.profit;
+    items.push({ id: l.o.id, name: l.o.name, tier: l.o.tier, buy: l.o.buy, sell: l.m.price, mode: l.m.mode,
+      qty: q, profit: Math.round(l.m.profit), roi: Math.round(l.m.roi * 10) / 10, total: Math.round(l.m.profit * q), vol: l.vol });
+  }
+  items.sort((x, y) => y.total - x.total);
+  return { items, cost: Math.round(cost), profit: Math.round(profit), count: items.length };
+}
+
+function buildRoutes(opps, vols, p, st = {}) {
+  const groups = {};
+  for (const o of opps) (groups[o.from + '|' + o.to] = groups[o.from + '|' + o.to] || []).push(o);
+  const routes = [];
+  for (const g of Object.values(groups)) {
+    const { from, to } = g[0];
+    const best = buildBasket(g, vols, p, 'best', st);
+    if (!best.count) continue;
+    const instant = buildBasket(g, vols, p, 'instant', st);
+    routes.push({ from, to, ...routeMeta(from, to), best, instant });
+  }
+  return routes;
+}
+
+function rankRoutes(routes, n = 10) {
+  const good = routes.filter(r => r.best.profit > 0);
+  return {
+    profit: good.slice().sort((a, b) => b.best.profit - a.best.profit).slice(0, n),
+    safe: good.slice().sort((a, b) => a.risk - b.risk || b.best.profit - a.best.profit).slice(0, n),
+    fast: routes.filter(r => r.instant.profit > 0).sort((a, b) => a.travel - b.travel || b.instant.profit - a.instant.profit).slice(0, n),
+  };
+}
+
+function funnelRoutesText(st, p) {
+  const n = k => st[k] || 0;
+  return [
+    `Предметов под фильтры: ${n('items')}, пар «город → город» с ценами: ${n('pairs')}`,
+    `Нет прибыли после налога: ${n('loss')}`,
+    `Прибыльно, но данные старше ${p.maxage} мин: ${n('stale')}`,
+    `ROI ниже ${p.minroi}%: ${n('roiLow')}, выше ${p.maxroi}%: ${n('roiHigh')}`,
+    `Подошло по ценам: ${n('ok')}`,
+    `Отсеяно по объёму (меньше ${p.minvol} за 24ч в городе продажи): ${n('lowVol')}`,
+    `Не загрузилось пачек: цены ${n('failP')}, объёмы ${n('failH')}`,
+  ].join('\n');
+}
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function getJSON(url, tries = 3) {
@@ -196,7 +358,7 @@ async function getJSON(url, tries = 3) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, funnelText, makeNameExtractor, localizeItems, CATEGORIES };
+  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, funnelText, makeNameExtractor, localizeItems, routeMeta, findOpps, candidateOpps, sumVolumesByCity, buildRoutes, rankRoutes, funnelRoutesText, CITIES, CATEGORIES };
 }
 
 /* ---------- интерфейс ---------- */
@@ -205,6 +367,15 @@ if (typeof document !== 'undefined') {
   const $ = id => document.getElementById(id) || document.createElement('input');  // страховка, если html и js из разных версий
   const FIELDS = ['server', 'city', 'cat', 'budget', 'tmin', 'tmax', 'emax', 'maxage', 'minroi', 'maxroi', 'minvol', 'premium', 'sort'];
   let items = null, namesRu = true, stop = false, running = false, results = [];
+  let view = 'single', tab = 'profit', ranked = null;
+  const TABS = [['profit', 'Выгодные'], ['safe', 'Безопасные'], ['fast', 'Быстрые']];
+  const HINTS = {
+    profit: 'Больше всего прибыли за один рейс. Продажа сразу в чужую заявку или своим ордером — что выгоднее.',
+    safe: 'Сначала маршруты с самым низким риском (без красных зон), внутри — по прибыли.',
+    fast: 'Короткий путь и продажа сразу в чужую заявку, без ожидания, пока купят твой ордер.',
+  };
+  const RISK_L = ['', 'низкий', 'средний', 'высокий'], TRAVEL_L = ['', 'короткий', 'средний', 'долгий'];
+  function setView(v) { view = v; $('tabs').hidden = v !== 'routes'; $('sortrow').hidden = v === 'routes'; }
 
   function fillSelect(el, values) {
     el.innerHTML = values.map(v => `<option>${v}</option>`).join('');
@@ -302,7 +473,32 @@ if (typeof document !== 'undefined') {
   function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   const fmt = n => Number(n).toLocaleString('ru-RU');
 
+  function renderRoutes() {
+    $('tabs').innerHTML = TABS.map(([k, t]) => `<button type="button" data-tab="${k}" class="${k === tab ? 'on' : ''}">${t}</button>`).join('');
+    const arr = ranked ? ranked[tab] : [];
+    const card = r => {
+      const b = tab === 'fast' ? r.instant : r.best;
+      const lines = b.items.slice(0, 5).map(i => `
+        <div class="it"><b>${esc(i.name)}</b> <span class="tier">${esc(i.tier)}</span><br>
+        <small>${fmt(i.buy)} → ${fmt(i.sell)} (${i.mode === 'instant' ? 'сразу в заявку' : 'своим ордером'}) · ${fmt(i.qty)} шт · <span class="gain">+${fmt(i.total)}</span></small></div>`).join('');
+      return `<article class="card">
+        <header><b>${esc(r.from)} → ${esc(r.to)}</b><span class="gain"><b>+${fmt(b.profit)}</b></span></header>
+        <div class="grid">
+          <div><small>Риск</small><span class="r${r.risk}">${RISK_L[r.risk]}</span></div>
+          <div><small>Путь</small>${TRAVEL_L[r.travel]}</div>
+          <div><small>Вложить</small>${fmt(b.cost)}</div>
+          <div><small>Предметов</small>${b.count} (показано ${Math.min(5, b.count)})</div>
+        </div>
+        <div class="its">${lines}</div>
+      </article>`;
+    };
+    $('list').innerHTML = (ranked ? `<p class="note">${arr.length ? HINTS[tab] : 'Для этой вкладки маршрутов не нашлось.'}</p>` : '')
+      + arr.map(card).join('')
+      + (ranked ? '<p class="note">Риск и длина пути — приблизительная оценка (вокруг Caerleon красные зоны), а не данные с карты. Вес и грузоподъёмность не учитываются, Чёрный рынок не включён.</p>' : '');
+  }
+
   function render() {
+    if (view === 'routes') return renderRoutes();
     const key = $('sort').value;
     const arr = results.slice().sort((a, b) => b[key] - a[key]);
     $('list').innerHTML = arr.map(r => `
@@ -323,8 +519,8 @@ if (typeof document !== 'undefined') {
   async function scan() {
     if (running) return;
     const p = readParams();
-    running = true; stop = false; results = []; render();
-    $('go').disabled = true; $('stop').disabled = false; $('filters').open = false;
+    running = true; stop = false; results = []; setView('single'); render();
+    $('go').disabled = true; $('route').disabled = true; $('stop').disabled = false; $('filters').open = false;
     try {
       setStatus('Загружаю список предметов…');
       await loadItems();
@@ -371,9 +567,66 @@ if (typeof document !== 'undefined') {
     } catch (err) {
       setStatus('Ошибка: ' + err.message);
     } finally {
-      running = false; $('go').disabled = false; $('stop').disabled = true;
+      running = false; $('go').disabled = false; $('route').disabled = false; $('stop').disabled = true;
     }
   }
+
+  async function scanRoutes() {
+    if (running) return;
+    const p = readParams();
+    running = true; stop = false; ranked = null; tab = 'profit'; setView('routes'); render();
+    $('go').disabled = true; $('route').disabled = true; $('stop').disabled = false; $('filters').open = false;
+    try {
+      setStatus('Загружаю список предметов…');
+      await loadItems();
+      const ids = buildIdList(items, p);
+      if (!ids.length) { setStatus('Под фильтры ничего не подошло.'); return; }
+      const st = { items: ids.length };
+      const loc = CITIES.map(encodeURIComponent).join(',');
+
+      const rows = [], batches = [];
+      for (let i = 0; i < ids.length; i += BATCH) batches.push(ids.slice(i, i + BATCH));
+      for (let n = 0; n < batches.length && !stop; n++) {
+        setStatus(`Цены во всех городах: запрос ${n + 1}/${batches.length} (предметов: ${ids.length})`);
+        setProgress(n + 1, batches.length);
+        try {
+          rows.push(...await getJSON(`https://${p.server}/api/v2/stats/prices/${batches[n].join(',')}.json?locations=${loc}&qualities=1`));
+        } catch (err) { st.failP = (st.failP || 0) + 1; }
+        await sleep(PAUSE);
+      }
+      if (stop) { setStatus('Остановлено.'); return; }
+      const opps = findOpps(rows, items, p, Date.now(), st);
+      if (!opps.length) { setStatus('Выгодных маршрутов под фильтры нет.\n' + funnelRoutesText(st, p)); return; }
+
+      const cand = candidateOpps(opps, p, 40);
+      const cids = [...new Set(cand.map(o => o.id))];
+      const vols = {}, hb = [];
+      for (let i = 0; i < cids.length; i += BATCH_H) hb.push(cids.slice(i, i + BATCH_H));
+      for (let n = 0; n < hb.length && !stop; n++) {
+        setStatus(`Объёмы за 24ч: запрос ${n + 1}/${hb.length} (предметов ${cids.length})`);
+        setProgress(n + 1, hb.length);
+        try {
+          sumVolumesByCity(await getJSON(`https://${p.server}/api/v2/stats/history/${hb[n].join(',')}?locations=${loc}&time-scale=1&qualities=1`), vols, Date.now());
+        } catch (err) { st.failH = (st.failH || 0) + 1; }
+        await sleep(PAUSE);
+      }
+      if (stop) { setStatus('Остановлено.'); return; }
+      const routes = buildRoutes(cand, vols, p, st);
+      ranked = rankRoutes(routes, 10);
+      render();
+      setStatus(`Готово: маршрутов с прибылью ${routes.length}.` + (namesRu ? '' : ' Русские названия не загрузились, показаны английские.') + '\n' + funnelRoutesText(st, p));
+    } catch (err) {
+      setStatus('Ошибка: ' + err.message);
+    } finally {
+      running = false; $('go').disabled = false; $('route').disabled = false; $('stop').disabled = true;
+    }
+  }
+
+  $('route').addEventListener('click', scanRoutes);
+  $('tabs').addEventListener('click', e => {
+    const t = e.target && e.target.dataset && e.target.dataset.tab;
+    if (t) { tab = t; renderRoutes(); }
+  });
 
   $('go').addEventListener('click', scan);
   $('stop').addEventListener('click', () => { stop = true; });
