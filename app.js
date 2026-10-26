@@ -16,12 +16,16 @@ const CATEGORIES = {
   'Шлемы': ['HEAD_'],
   'Обувь': ['SHOES_'],
   'Сумки и плащи': ['BAG', 'CAPEITEM'],
-  'Ресурсы (сырьё)': ['_WOOD', '_ROCK', '_ORE', '_FIBER', '_HIDE'],
-  'Ресурсы (обработанные)': ['_PLANKS', '_STONEBLOCK', '_METALBAR', '_CLOTH', '_LEATHER'],
+  // '^' = id (после префикса тира) должен начинаться с ключа, иначе _CLOTH/_LEATHER цепляют броню
+  'Ресурсы (сырьё)': ['^WOOD', '^ROCK', '^ORE', '^FIBER', '^HIDE'],
+  'Ресурсы (обработанные)': ['^PLANKS', '^STONEBLOCK', '^METALBAR', '^CLOTH', '^LEATHER'],
   'Еда': ['MEAL_'],
   'Зелья': ['POTION_'],
 };
 const ITEMS_URL = 'https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.txt';
+const NAMES_URL = 'https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.json';
+const NAMES_KEY = 'https://afh.local/names-ru-v1.json';   // фиктивный адрес для кэша компактной карты названий
+const NAMES_TTL = 30 * 86400000;
 const SETUP_FEE = 0.025;   // сбор за создание ордера (покупка и продажа)
 const BATCH = 100;         // предметов на запрос цен
 const BATCH_H = 50;        // предметов на запрос истории
@@ -73,23 +77,63 @@ function buildIdList(items, p) {
   for (const id of Object.keys(items)) {
     const [t, e] = tierEnchant(id);
     if (t < p.tmin || t > p.tmax || e > p.emax) continue;
-    if (kws.length && !kws.some(k => id.includes(k))) continue;
+    if (kws.length) {
+      const body = id.replace(/^T\d_/, '');
+      if (!kws.some(k => k[0] === '^' ? body.startsWith(k.slice(1)) : id.includes(k))) continue;
+    }
     ids.push(id);
   }
   return ids;
 }
 
-function processPrices(rows, items, p, nowMs) {
+/* Разбор огромного formatted/items.json без загрузки целиком в память:
+   принимает текст кусками (push), на выходе компактная карта {UniqueName: русское название}. */
+function makeNameExtractor() {
+  const map = {};
+  let buf = '';
+  const unq = s => { try { return JSON.parse('"' + s + '"'); } catch (e) { return s; } };
+  function take(id, seg) {
+    const blk = /"LocalizedNames"\s*:\s*\{([^}]*)\}/.exec(seg);
+    if (!blk) return;
+    const ru = /"RU-RU"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(blk[1]);
+    const en = /"EN-US"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(blk[1]);
+    const v = (ru && ru[1]) || (en && en[1]);
+    if (v) map[id] = unq(v);
+  }
+  return {
+    push(chunk) {
+      buf += chunk;
+      const rx = /"UniqueName"\s*:\s*"([^"]+)"/g;
+      let last = 0, m;
+      while ((m = rx.exec(buf))) { take(m[1], buf.slice(last, m.index)); last = rx.lastIndex; }
+      buf = buf.slice(last);
+    },
+    result() { return map; },
+  };
+}
+
+function localizeItems(items, ru) {
+  for (const id of Object.keys(items)) {
+    items[id] = ru[id] || ru[id.replace(/@\d$/, '')] || items[id];
+  }
+  return items;
+}
+
+function processPrices(rows, items, p, nowMs, st = {}) {
+  const inc = k => { st[k] = (st[k] || 0) + 1; };
   const out = [];
   for (const r of rows) {
+    inc('rows');
     const buy = r.buy_price_max || 0, sell = r.sell_price_min || 0;
-    if (buy <= 0 || sell <= 0 || sell - buy < 3) continue;
-    const age = ageMin(nowMs, r.buy_price_max_date, r.sell_price_min_date);
-    if (age === null || age > p.maxage) continue;
+    if (buy <= 0 || sell <= 0) { inc('noPrice'); continue; }
     const f = calcFlip(buy, sell, p.premium);
-    if (f.profit <= 0 || f.roi < p.minroi || f.roi > p.maxroi) continue;
+    if (sell - buy < 3 || f.profit <= 0) { inc('loss'); continue; }
+    const age = ageMin(nowMs, r.buy_price_max_date, r.sell_price_min_date);
+    if (age === null || age > p.maxage) { inc('stale'); continue; }
+    if (f.roi < p.minroi) { inc('roiLow'); continue; }
+    if (f.roi > p.maxroi) { inc('roiHigh'); continue; }
     const qty = Math.floor(p.budget / (f.myBuy * (1 + SETUP_FEE)));
-    if (qty < 1) continue;
+    if (qty < 1) { inc('budget'); continue; }
     const [t, e] = tierEnchant(r.item_id);
     out.push({
       id: r.item_id, name: items[r.item_id] || r.item_id, tier: `T${t}.${e}`,
@@ -99,6 +143,20 @@ function processPrices(rows, items, p, nowMs) {
     });
   }
   return out;
+}
+
+function funnelText(st, p) {
+  const n = k => st[k] || 0;
+  return [
+    `Предметов под фильтры: ${n('items')}, цены пришли по: ${n('rows')}`,
+    `Нет цены покупки или продажи: ${n('noPrice')}`,
+    `Спред слишком мал (убыток после налога): ${n('loss')}`,
+    `Прибыльно, но данные старше ${p.maxage} мин: ${n('stale')}`,
+    `ROI ниже ${p.minroi}%: ${n('roiLow')}, выше ${p.maxroi}%: ${n('roiHigh')}`,
+    `Не хватило бюджета: ${n('budget')}`,
+    `Отсеяно по объёму (меньше ${p.minvol} за 24ч): ${n('lowVol')}`,
+    `Не загрузилось пачек: цены ${n('failP')}, объёмы ${n('failH')}`,
+  ].join('\n');
 }
 
 function sumVolumes(entries, vols, nowMs) {
@@ -133,7 +191,7 @@ async function getJSON(url, tries = 3) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, CATEGORIES };
+  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, funnelText, makeNameExtractor, localizeItems, CATEGORIES };
 }
 
 /* ---------- интерфейс ---------- */
@@ -141,7 +199,7 @@ if (typeof module !== 'undefined') {
 if (typeof document !== 'undefined') {
   const $ = id => document.getElementById(id) || document.createElement('input');  // страховка, если html и js из разных версий
   const FIELDS = ['server', 'city', 'cat', 'budget', 'tmin', 'tmax', 'emax', 'maxage', 'minroi', 'maxroi', 'minvol', 'premium', 'sort'];
-  let items = null, stop = false, running = false, results = [];
+  let items = null, namesRu = true, stop = false, running = false, results = [];
 
   function fillSelect(el, values) {
     el.innerHTML = values.map(v => `<option>${v}</option>`).join('');
@@ -179,6 +237,38 @@ if (typeof document !== 'undefined') {
   function setStatus(t) { $('status').textContent = t; }
   function setProgress(n, total) { const pb = $('pb'); pb.max = total; pb.value = n; }
 
+  async function loadNamesRu() {
+    const cache = await caches.open('afh-data');
+    const stamp = +localStorage.getItem('afh-names-ts') || 0;
+    const old = await cache.match(NAMES_KEY);
+    if (old && Date.now() - stamp < NAMES_TTL) return await old.json();
+    try {
+      const r = await fetch(NAMES_URL);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const ex = makeNameExtractor();
+      if (r.body) {
+        const reader = r.body.getReader(), dec = new TextDecoder();
+        let bytes = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.length;
+          ex.push(dec.decode(value, { stream: true }));
+          setStatus(`Загружаю русские названия (один раз в 30 дней): ${(bytes / 1048576).toFixed(0)} МБ…`);
+        }
+      } else {
+        ex.push(await r.text());
+      }
+      const map = ex.result();
+      if (Object.keys(map).length < 100) throw new Error('пустой список названий');
+      await cache.put(NAMES_KEY, new Response(JSON.stringify(map), { headers: { 'Content-Type': 'application/json' } }));
+      localStorage.setItem('afh-names-ts', String(Date.now()));
+      return map;
+    } catch (err) {
+      return old ? await old.json() : null;   // нет сети — берём старый кэш, иначе остаются английские названия
+    }
+  }
+
   async function loadItems() {
     if (items) return items;
     const cache = await caches.open('afh-data');
@@ -195,7 +285,12 @@ if (typeof document !== 'undefined') {
         if (!resp) throw err;       // нет сети, но есть старый кэш — используем его
       }
     }
-    items = parseItems(await resp.text());
+    const list = parseItems(await resp.text());
+    setStatus('Загружаю русские названия…');
+    let ru = null;
+    try { ru = await loadNamesRu(); } catch (e) { /* остаются английские */ }
+    namesRu = !!ru;
+    items = ru ? localizeItems(list, ru) : list;
     return items;
   }
 
@@ -231,6 +326,7 @@ if (typeof document !== 'undefined') {
       const ids = buildIdList(items, p);
       if (!ids.length) { setStatus('Под фильтры ничего не подошло.'); return; }
       const note = ` (предметов: ${ids.length})`;
+      const st = { items: ids.length };
 
       const rows = [];
       const batches = [];
@@ -240,11 +336,11 @@ if (typeof document !== 'undefined') {
         setProgress(n + 1, batches.length);
         try {
           rows.push(...await getJSON(`https://${p.server}/api/v2/stats/prices/${batches[n].join(',')}.json?locations=${encodeURIComponent(p.city)}&qualities=1`));
-        } catch (err) { /* пропускаем упавшую пачку */ }
+        } catch (err) { st.failP = (st.failP || 0) + 1; }
         await sleep(PAUSE);
       }
-      const cands = processPrices(rows, items, p, Date.now());
-      if (!cands.length || stop) { setStatus(stop ? 'Остановлено.' : 'Под фильтры по цене ничего не подошло.'); return; }
+      const cands = processPrices(rows, items, p, Date.now(), st);
+      if (!cands.length || stop) { setStatus((stop ? 'Остановлено.' : 'Под фильтры по цене ничего не подошло.') + '\n' + funnelText(st, p)); return; }
 
       const vols = Object.fromEntries(cands.map(c => [c.id, 0]));
       const cids = cands.map(c => c.id);
@@ -255,18 +351,18 @@ if (typeof document !== 'undefined') {
         setProgress(n + 1, hb.length);
         try {
           sumVolumes(await getJSON(`https://${p.server}/api/v2/stats/history/${hb[n].join(',')}?locations=${encodeURIComponent(p.city)}&time-scale=1&qualities=1`), vols, Date.now());
-        } catch (err) { /* пропускаем */ }
+        } catch (err) { st.failH = (st.failH || 0) + 1; }
         await sleep(PAUSE);
       }
       results = [];
       for (const c of cands) {
         const v = vols[c.id] || 0;
-        if (v < p.minvol) continue;
+        if (v < p.minvol) { st.lowVol = (st.lowVol || 0) + 1; continue; }
         c.vol = v; c.qty = Math.min(c.qty, v); c.total = Math.round(c.profit * c.qty);
         results.push(c);
       }
       render();
-      setStatus(`Готово: найдено ${results.length}. Сортировка — по выбранному полю.`);
+      setStatus(`Готово: найдено ${results.length}.` + (namesRu ? '' : ' Русские названия не загрузились, показаны английские.') + '\n' + funnelText(st, p));
     } catch (err) {
       setStatus('Ошибка: ' + err.message);
     } finally {
@@ -278,8 +374,8 @@ if (typeof document !== 'undefined') {
   $('stop').addEventListener('click', () => { stop = true; });
   $('stop').disabled = true;
   $('refresh').addEventListener('click', async () => {
-    localStorage.removeItem('afh-items-ts'); items = null;
-    try { await (await caches.open('afh-data')).delete(ITEMS_URL); } catch (e) { /* ignore */ }
+    localStorage.removeItem('afh-items-ts'); localStorage.removeItem('afh-names-ts'); items = null;
+    try { const c = await caches.open('afh-data'); await c.delete(ITEMS_URL); await c.delete(NAMES_KEY); } catch (e) { /* ignore */ }
     setStatus('Список предметов обновится при следующем скане.');
   });
 
