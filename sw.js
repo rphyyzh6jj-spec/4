@@ -1,5 +1,5 @@
 // Кэширует оболочку приложения, чтобы оно открывалось без сети. Данные API не кэшируются.
-const CACHE = 'afh-shell-v3';
+const CACHE = 'afh-shell-v4';
 const SHELL = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

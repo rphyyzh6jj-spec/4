@@ -26,7 +26,6 @@ const SETUP_FEE = 0.025;   // сбор за создание ордера (по�
 const BATCH = 100;         // предметов на запрос цен
 const BATCH_H = 50;        // предметов на запрос истории
 const PAUSE = 450;         // мс между запросами (лимит API ~180/мин)
-const MAX_ITEMS = 1500;    // потолок предметов за скан
 
 /* ---------- чистая логика (тестируется в node) ---------- */
 
@@ -229,10 +228,9 @@ if (typeof document !== 'undefined') {
     try {
       setStatus('Загружаю список предметов…');
       await loadItems();
-      let ids = buildIdList(items, p);
+      const ids = buildIdList(items, p);
       if (!ids.length) { setStatus('Под фильтры ничего не подошло.'); return; }
-      let note = '';
-      if (ids.length > MAX_ITEMS) { note = ` (из ${ids.length}, сузь фильтры для полного скана)`; ids = ids.slice(0, MAX_ITEMS); }
+      const note = ` (предметов: ${ids.length})`;
 
       const rows = [];
       const batches = [];
