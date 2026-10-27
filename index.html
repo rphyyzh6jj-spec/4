@@ -47,7 +47,7 @@ progress { width:100%; height:6px; accent-color: var(--gold); }
 .bar button { flex:1; font-size:15px; padding:12px 6px; } #go { background:var(--gold); color:#1a1405; flex:2; }
 #route { background:#2b3f73; color:#fff; flex:2; }
 #stop { background:var(--card); color:var(--text); border:1px solid var(--line); }
-#go:disabled, #route:disabled, #stop:disabled { opacity:.45; }
+#go:disabled, #route:disabled, #craft:disabled, #stop:disabled { opacity:.45; }
 .tabs { display:flex; gap:6px; margin:10px 0; }
 .tabs button { flex:1; padding:9px 4px; font-size:14px; background:var(--card); color:var(--text); border:1px solid var(--line); }
 .tabs button.on { background:var(--gold); color:#1a1405; border-color:var(--gold); }
@@ -55,12 +55,18 @@ progress { width:100%; height:6px; accent-color: var(--gold); }
 .its { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
 .it { margin-bottom:7px; font-size:14px; } .it small { color:var(--mute); font-size:12px; }
 .r1 { color:var(--gain); } .r2 { color:var(--gold); } .r3 { color:#ff6b6b; }
+.pages { display:flex; gap:6px; margin:4px 0 12px; }
+.pages button { flex:1; padding:10px 6px; font-size:15px; background:var(--card); color:var(--text); border:1px solid var(--line); }
+.pages button.on { background:var(--gold); color:#1a1405; border-color:var(--gold); }
+#craft { background:var(--gold); color:#1a1405; flex:3; }
+.comp { font-size:13px; color:var(--mute); margin:2px 0; }
 .note { color:var(--mute); font-size:12px; margin-top:16px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Albion <span>Flip</span></h1>
+  <div class="pages"><button id="pgFlip" type="button" class="on">Флип</button><button id="pgCraft" type="button">Крафт</button></div>
 
   <details id="filters" open>
     <summary>Фильтры</summary>
@@ -81,6 +87,32 @@ progress { width:100%; height:6px; accent-color: var(--gold); }
     <button class="link" id="refresh" type="button">Обновить список предметов</button>
   </details>
 
+  <details id="cfilters" open hidden>
+    <summary>Фильтры крафта</summary>
+    <div class="form">
+      <label>Сервер<select id="cserver"></select></label>
+      <label>Тир готового предмета<select id="ctier"></select></label>
+      <label>Город покупки компонентов<select id="cbuy"></select></label>
+      <label>Город продажи готового<select id="csell"></select></label>
+      <label class="wide">Категория<select id="ccat"></select></label>
+      <label>Зачарование готового<select id="cench"></select></label>
+      <label>Возврат ресурсов, %<input id="crrr" type="number" step="0.1" min="0" max="90"></label>
+      <label>Плата станции, % от ресурсов<input id="cfee" type="number" step="0.1" min="0"></label>
+      <label>Покупка компонентов<select id="cbuymode">
+        <option value="instant">сразу (по чужим ордерам)</option>
+        <option value="order">своим ордером</option></select></label>
+      <label>Продажа готового<select id="csellmode">
+        <option value="best">что выгоднее</option>
+        <option value="order">своим ордером</option>
+        <option value="instant">сразу в заявку</option></select></label>
+      <label>Свежесть цен до (мин)<input id="cmaxage" type="number" min="1"></label>
+      <label>Мин. продаж за 24ч<input id="cminvol" type="number" min="0"></label>
+      <label>Мин. ROI %<input id="cminroi" type="number" step="0.1"></label>
+      <label>Макс. ROI %<input id="cmaxroi" type="number" step="1"></label>
+      <label class="wide check"><input id="cpremium" type="checkbox"> Есть премиум (налог 4% вместо 8%)</label>
+    </div>
+  </details>
+
   <div id="status">Выбери фильтры и нажми «Сканировать». Макс. ROI отсекает подозрительные цены.</div>
   <progress id="pb" value="0" max="1"></progress>
 
@@ -95,7 +127,16 @@ progress { width:100%; height:6px; accent-color: var(--gold); }
 
   <div class="tabs" id="tabs" hidden></div>
 
+  <div class="sortrow" id="csortrow" hidden>Сортировать:
+    <select id="csort">
+      <option value="profit">по прибыли с штуки</option>
+      <option value="roi">по ROI</option>
+      <option value="vol">по объёму продаж</option>
+    </select>
+  </div>
+
   <div id="list"></div>
+  <div id="clist" hidden></div>
   <p class="note">Программа только показывает расчёты и ничего не делает в игре. Ордера ставишь сам.
   Объёмы присылают игроки, реальные продажи обычно выше.</p>
 </main>
@@ -103,8 +144,9 @@ progress { width:100%; height:6px; accent-color: var(--gold); }
 <div class="bar">
   <button id="go">Сканировать</button>
   <button id="route">Между городами</button>
+  <button id="craft" hidden>Считать крафт</button>
   <button id="stop">Стоп</button>
 </div>
-<script src="app.js?v=9"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>

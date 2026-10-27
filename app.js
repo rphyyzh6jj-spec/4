@@ -341,6 +341,144 @@ function funnelRoutesText(st, p) {
   ].join('\n');
 }
 
+/* ---------- крафт ---------- */
+const RECIPES_URLS = [
+  'https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/items.json',
+  'https://raw.githubusercontent.com/broderickhyman/ao-bin-dumps/master/items.json',
+];
+const RECIPES_KEY = 'https://afh.local/recipes-v1.json';
+const RECIPES_TTL = 30 * 86400000;
+const MIN_RECIPES = 50;   // если разобрали меньше — считаем, что формат файла не тот
+/* Эти компоненты при крафте не возвращаются (артефакты, руны, души, реликвии и т.п.) */
+const NO_RETURN = /ARTEFACT|ARTIFACT|RUNE|SOUL|RELIC|SHARD|QUESTITEM|CREST|JOURNAL|_CAPE$/;
+
+const asArr = x => (x == null ? [] : Array.isArray(x) ? x : [x]);
+
+function resId(c) {
+  let id = c['@uniquename'];
+  const lvl = c['@enchantmentlevel'];
+  if (!id) return null;
+  if (id.includes('@')) return id;
+  if (lvl && +lvl > 0) return `${id}@${lvl}`;
+  const m = /_LEVEL(\d)$/.exec(id);
+  return m ? `${id}@${m[1]}` : id;
+}
+
+function parseReqs(cr, fallbackAmount) {
+  for (const r of asArr(cr)) {
+    if (!r || typeof r !== 'object') continue;
+    const res = asArr(r.craftresource).map(c => [resId(c), +c['@count']]).filter(([id, n]) => id && n > 0);
+    if (res.length) return { r: res, a: +(r['@amountcrafted'] || fallbackAmount || 1) || 1 };
+  }
+  return null;
+}
+
+/* Ищем по всему файлу объекты с @uniquename и craftingrequirements — не зависит от того, в каком
+   разделе (simpleitem / equipmentitem / weapon…) лежит предмет. Зачарованные варианты — id@N. */
+function extractRecipes(root) {
+  const out = {};
+  (function walk(node) {
+    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+    if (!node || typeof node !== 'object') return;
+    const id = node['@uniquename'];
+    if (typeof id === 'string' && node.craftingrequirements) {
+      const rec = parseReqs(node.craftingrequirements, node['@amountcrafted']);
+      if (rec) out[id] = rec;
+      for (const en of asArr(node.enchantments && node.enchantments.enchantment)) {
+        const lvl = en && en['@enchantmentlevel'];
+        if (lvl && en.craftingrequirements) {
+          const r2 = parseReqs(en.craftingrequirements, node['@amountcrafted']);
+          if (r2) out[`${id}@${lvl}`] = r2;
+        }
+      }
+    }
+    for (const k in node) if (node[k] && typeof node[k] === 'object') walk(node[k]);
+  })(root);
+  return out;
+}
+
+function indexPrices(rows) {
+  const P = {};
+  for (const r of rows) (P[r.item_id] = P[r.item_id] || {})[norm(r.city)] = r;
+  return P;
+}
+
+/* Компоненты покупаем в городе A, готовое продаём в городе B.
+   Возврат ресурсов (rrr %) снижает стоимость возвращаемых компонентов; плата станции — % от стоимости ресурсов. */
+function evalCrafts(ids, recipes, rows, items, p, nowMs, st = {}) {
+  const inc = k => { st[k] = (st[k] || 0) + 1; };
+  const P = indexPrices(rows);
+  const tax = p.premium ? 0.04 : 0.08;
+  const ageOf = d => ageMin(nowMs, d, d);
+  const out = [];
+  for (const id of ids) {
+    const rec = recipes[id];
+    if (!rec) continue;
+    const fr = P[id] && P[id][norm(p.sellCity)];
+    const opts = [];
+    if (fr && fr.buy_price_max > 0) opts.push({ mode: 'instant', price: fr.buy_price_max, net: fr.buy_price_max * (1 - tax), date: fr.buy_price_max_date });
+    if (fr && fr.sell_price_min > 1) opts.push({ mode: 'order', price: fr.sell_price_min - 1, net: (fr.sell_price_min - 1) * (1 - tax - SETUP_FEE), date: fr.sell_price_min_date });
+    const allowed = p.sellMode === 'best' ? opts : opts.filter(o => o.mode === p.sellMode);
+    if (!allowed.length) { inc('noSell'); continue; }
+
+    let raw = 0, net = 0, missing = false, compAge = 0, compStale = false;
+    const comps = [];
+    for (const [rid, count] of rec.r) {
+      const cr = P[rid] && P[rid][norm(p.buyCity)];
+      let price = 0, date = null;
+      if (cr) {
+        if (p.buyMode === 'order') { price = cr.buy_price_max > 0 ? cr.buy_price_max + 1 : 0; date = cr.buy_price_max_date; }
+        else { price = cr.sell_price_min || 0; date = cr.sell_price_min_date; }
+      }
+      if (!(price > 0)) { missing = true; break; }
+      const age = ageOf(date);
+      if (age === null) compStale = true; else compAge = Math.max(compAge, age);
+      const returnable = !NO_RETURN.test(rid);
+      raw += count * price;
+      net += count * price * (returnable ? 1 - p.rrr / 100 : 1);
+      comps.push({ id: rid, name: items[rid] || rid, count, price, returnable });
+    }
+    if (missing) { inc('noComp'); continue; }
+    if (p.buyMode === 'order') net *= 1 + SETUP_FEE;
+    net += raw * (p.fee || 0) / 100;
+    const unitCost = net / rec.a;
+
+    const profitable = allowed.filter(o => o.net > unitCost);
+    if (!profitable.length) { inc('loss'); continue; }
+    const fresh = [];
+    for (const o of profitable) {
+      const a = ageOf(o.date);
+      if (!compStale && a !== null && Math.max(a, compAge) <= p.maxage) { o.age = Math.max(a, compAge); fresh.push(o); }
+    }
+    if (!fresh.length) { inc('stale'); continue; }
+    fresh.sort((x, y) => y.net - x.net);
+    const o = fresh[0];
+    const profit = o.net - unitCost;
+    const roi = profit / unitCost * 100;
+    if (roi < p.minroi) { inc('roiLow'); continue; }
+    if (roi > p.maxroi) { inc('roiHigh'); continue; }
+    inc('ok');
+    const [t, e] = tierEnchant(id);
+    out.push({ id, name: items[id] || id, tier: `T${t}.${e}`, cost: Math.round(unitCost), sell: o.price, mode: o.mode,
+      profit: Math.round(profit), roi: Math.round(roi * 10) / 10, comps, amount: rec.a, age: Math.round(o.age), vol: 0 });
+  }
+  return out;
+}
+
+function craftFunnelText(st, p) {
+  const n = k => st[k] || 0;
+  return [
+    `Предметов под фильтры: ${n('items')}, с рецептом: ${n('items') - n('noRecipe')}`,
+    `Нет цены готового в ${p.sellCity}: ${n('noSell')}`,
+    `Нет цены компонента в ${p.buyCity}: ${n('noComp')}`,
+    `Убыточно: ${n('loss')}`,
+    `Прибыльно, но данные старше ${p.maxage} мин: ${n('stale')}`,
+    `ROI ниже ${p.minroi}%: ${n('roiLow')}, выше ${p.maxroi}%: ${n('roiHigh')}`,
+    `Отсеяно по объёму (меньше ${p.minvol} за 24ч): ${n('lowVol')}`,
+    `Не загрузилось пачек: цены ${n('failP')}, объёмы ${n('failH')}`,
+  ].join('\n');
+}
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function getJSON(url, tries = 3) {
@@ -359,14 +497,15 @@ async function getJSON(url, tries = 3) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, funnelText, makeNameExtractor, localizeItems, routeMeta, findOpps, candidateOpps, sumVolumesByCity, buildRoutes, rankRoutes, funnelRoutesText, CITIES, CATEGORIES };
+  module.exports = { calcFlip, tierEnchant, ageMin, parseItems, buildIdList, processPrices, sumVolumes, funnelText, makeNameExtractor, localizeItems, routeMeta, findOpps, candidateOpps, sumVolumesByCity, buildRoutes, rankRoutes, funnelRoutesText, extractRecipes, evalCrafts, craftFunnelText, resId, CITIES, CATEGORIES };
 }
 
 /* ---------- интерфейс ---------- */
 
 if (typeof document !== 'undefined') {
   const $ = id => document.getElementById(id) || document.createElement('input');  // страховка, если html и js из разных версий
-  const FIELDS = ['server', 'city', 'cat', 'budget', 'tmin', 'tmax', 'emax', 'maxage', 'minroi', 'maxroi', 'minvol', 'premium', 'sort'];
+  const FIELDS = ['server', 'city', 'cat', 'budget', 'tmin', 'tmax', 'emax', 'maxage', 'minroi', 'maxroi', 'minvol', 'premium', 'sort',
+    'cserver', 'ctier', 'cbuy', 'csell', 'ccat', 'cench', 'crrr', 'cfee', 'cbuymode', 'csellmode', 'cmaxage', 'cminvol', 'cminroi', 'cmaxroi', 'cpremium', 'csort'];
   let items = null, namesRu = true, stop = false, running = false, results = [];
   let view = 'single', tab = 'profit', ranked = null;
   const TABS = [['profit', 'Выгодные'], ['safe', 'Безопасные'], ['fast', 'Быстрые']];
@@ -376,7 +515,17 @@ if (typeof document !== 'undefined') {
     fast: 'Короткий путь и продажа сразу в чужую заявку, без ожидания, пока купят твой ордер.',
   };
   const RISK_L = ['', 'низкий', 'средний', 'высокий'], TRAVEL_L = ['', 'короткий', 'средний', 'долгий'];
-  function setView(v) { view = v; $('tabs').hidden = v !== 'routes'; $('sortrow').hidden = v === 'routes'; }
+  let page = 'flip', recipes = null, cresults = [];
+  function applyPage() {
+    const f = page === 'flip';
+    $('filters').hidden = !f; $('list').hidden = !f;
+    $('sortrow').hidden = !f || view === 'routes';
+    $('tabs').hidden = !f || view !== 'routes';
+    $('go').hidden = !f; $('route').hidden = !f;
+    $('cfilters').hidden = f; $('clist').hidden = f; $('csortrow').hidden = f; $('craft').hidden = f;
+    $('pgFlip').className = f ? 'on' : ''; $('pgCraft').className = f ? '' : 'on';
+  }
+  function setView(v) { view = v; applyPage(); }
 
   function fillSelect(el, values) {
     el.innerHTML = values.map(v => `<option>${v}</option>`).join('');
@@ -384,9 +533,17 @@ if (typeof document !== 'undefined') {
   fillSelect($('server'), Object.keys(SERVERS));
   fillSelect($('city'), CITIES);
   fillSelect($('cat'), Object.keys(CATEGORIES));
+  fillSelect($('cserver'), Object.keys(SERVERS));
+  fillSelect($('ctier'), ['1', '2', '3', '4', '5', '6', '7', '8']);
+  fillSelect($('cench'), ['0', '1', '2', '3', '4']);
+  fillSelect($('cbuy'), CITIES);
+  fillSelect($('csell'), CITIES);
+  fillSelect($('ccat'), ['Оружие', 'Броня (тело)', 'Шлемы', 'Обувь', 'Сумки и плащи', 'Ресурсы (обработанные)', 'Еда', 'Зелья', 'Всё']);
 
   const defaults = { server: 'Европа', city: 'Caerleon', cat: 'Оружие', budget: '1000000', tmin: '4', tmax: '6',
-    emax: '0', maxage: '60', minroi: '5', maxroi: '150', minvol: '10', premium: true, sort: 'total' };
+    emax: '0', maxage: '60', minroi: '5', maxroi: '150', minvol: '10', premium: true, sort: 'total',
+    cserver: 'Европа', ctier: '4', cbuy: 'Bridgewatch', csell: 'Caerleon', ccat: 'Оружие', cench: '0', crrr: '15.2', cfee: '0',
+    cbuymode: 'instant', csellmode: 'best', cmaxage: '180', cminvol: '5', cminroi: '5', cmaxroi: '300', cpremium: true, csort: 'profit' };
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem('afh-settings') || '{}'); } catch (e) { /* ignore */ }
   for (const f of FIELDS) {
@@ -521,7 +678,7 @@ if (typeof document !== 'undefined') {
     if (running) return;
     const p = readParams();
     running = true; stop = false; results = []; setView('single'); render();
-    $('go').disabled = true; $('route').disabled = true; $('stop').disabled = false; $('filters').open = false;
+    $('go').disabled = true; $('route').disabled = true; $('craft').disabled = true; $('stop').disabled = false; $('filters').open = false;
     try {
       setStatus('Загружаю список предметов…');
       await loadItems();
@@ -568,7 +725,7 @@ if (typeof document !== 'undefined') {
     } catch (err) {
       setStatus('Ошибка: ' + err.message);
     } finally {
-      running = false; $('go').disabled = false; $('route').disabled = false; $('stop').disabled = true;
+      running = false; $('go').disabled = false; $('route').disabled = false; $('craft').disabled = false; $('stop').disabled = true;
     }
   }
 
@@ -576,7 +733,7 @@ if (typeof document !== 'undefined') {
     if (running) return;
     const p = readParams();
     running = true; stop = false; ranked = null; tab = 'profit'; setView('routes'); render();
-    $('go').disabled = true; $('route').disabled = true; $('stop').disabled = false; $('filters').open = false;
+    $('go').disabled = true; $('route').disabled = true; $('craft').disabled = true; $('stop').disabled = false; $('filters').open = false;
     try {
       setStatus('Загружаю список предметов…');
       await loadItems();
@@ -620,7 +777,7 @@ if (typeof document !== 'undefined') {
     } catch (err) {
       setStatus('Ошибка: ' + err.message);
     } finally {
-      running = false; $('go').disabled = false; $('route').disabled = false; $('stop').disabled = true;
+      running = false; $('go').disabled = false; $('route').disabled = false; $('craft').disabled = false; $('stop').disabled = true;
     }
   }
 
@@ -630,12 +787,137 @@ if (typeof document !== 'undefined') {
     if (t) { tab = t; renderRoutes(); }
   });
 
+  function readCraftParams() {
+    const num = (id, d) => { const v = parseFloat(String($(id).value).replace(/\s/g, '')); return isNaN(v) ? d : v; };
+    return {
+      server: SERVERS[$('cserver').value], buyCity: $('cbuy').value, sellCity: $('csell').value, cat: $('ccat').value,
+      tier: num('ctier', 4), ench: num('cench', 0), rrr: num('crrr', 0), fee: num('cfee', 0),
+      buyMode: $('cbuymode').value, sellMode: $('csellmode').value,
+      maxage: num('cmaxage', 180), minvol: num('cminvol', 0), minroi: num('cminroi', 0), maxroi: num('cmaxroi', 1e9),
+      premium: $('cpremium').checked,
+    };
+  }
+
+  async function loadRecipes() {
+    if (recipes) return recipes;
+    const cache = await caches.open('afh-data');
+    const stamp = +localStorage.getItem('afh-recipes-ts') || 0;
+    const old = await cache.match(RECIPES_KEY);
+    if (old && Date.now() - stamp < RECIPES_TTL) { recipes = await old.json(); return recipes; }
+    setStatus('Загружаю рецепты крафта (один раз в 30 дней, файл большой)…');
+    let lastErr = null;
+    for (const url of RECIPES_URLS) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const map = extractRecipes(await r.json());
+        const n = Object.keys(map).length;
+        if (n < MIN_RECIPES) throw new Error(`в файле нашлось только ${n} рецептов, формат не тот`);
+        await cache.put(RECIPES_KEY, new Response(JSON.stringify(map), { headers: { 'Content-Type': 'application/json' } }));
+        localStorage.setItem('afh-recipes-ts', String(Date.now()));
+        recipes = map;
+        return recipes;
+      } catch (err) { lastErr = err; }
+    }
+    if (old) { recipes = await old.json(); return recipes; }   // нет сети — старый кэш
+    throw new Error('Не удалось получить рецепты: ' + (lastErr && lastErr.message));
+  }
+
+  function renderCraft() {
+    const key = $('csort').value;
+    const arr = cresults.slice().sort((a, b) => b[key] - a[key]);
+    $('clist').innerHTML = arr.map(r => `
+      <article class="card">
+        <header><b>${esc(r.name)}</b><span class="tier">${esc(r.tier)}</span></header>
+        <div class="grid">
+          <div><small>Себестоимость → цена</small>${fmt(r.cost)} → <b>${fmt(r.sell)}</b> (${r.mode === 'instant' ? 'сразу' : 'ордером'})</div>
+          <div><small>Прибыль с шт. · ROI</small><b class="gain">+${fmt(r.profit)}</b> · ${r.roi}%</div>
+          <div><small>Продано за 24ч</small>${fmt(r.vol)}</div>
+          <div><small>За один крафт</small>${r.amount} шт.</div>
+        </div>
+        <div class="its">${r.comps.map(c => `<div class="comp">${c.count} × ${esc(c.name)} — ${fmt(c.price)}${c.returnable ? '' : ' (без возврата)'}</div>`).join('')}</div>
+        <footer>данным ${r.age} мин</footer>
+      </article>`).join('')
+      + (arr.length ? '<p class="note">Себестоимость учитывает возврат ресурсов и плату станции из фильтров. Фокус, налог за использование станции по предмету и время крафта не считаются точно: проверь в игре.</p>' : '');
+  }
+
+  async function scanCraft() {
+    if (running) return;
+    const p = readCraftParams();
+    running = true; stop = false; cresults = []; renderCraft();
+    $('go').disabled = true; $('route').disabled = true; $('craft').disabled = true; $('stop').disabled = false; $('cfilters').open = false;
+    try {
+      setStatus('Загружаю список предметов…');
+      await loadItems();
+      await loadRecipes();
+      const st = {};
+      const ids = buildIdList(items, { cat: p.cat, tmin: p.tier, tmax: p.tier, emax: p.ench })
+        .filter(id => tierEnchant(id)[1] === p.ench);
+      st.items = ids.length;
+      const withRec = ids.filter(id => recipes[id]);
+      st.noRecipe = ids.length - withRec.length;
+      if (!withRec.length) {
+        setStatus(`Для T${p.tier}.${p.ench} в категории «${p.cat}» рецептов не нашлось (предметов: ${ids.length}, рецептов в базе: ${Object.keys(recipes).length}).`);
+        return;
+      }
+      const need = new Set(withRec);
+      for (const id of withRec) for (const [rid] of recipes[id].r) need.add(rid);
+      const all = [...need];
+      const loc = [...new Set([p.buyCity, p.sellCity])].map(encodeURIComponent).join(',');
+
+      const rows = [], batches = [];
+      for (let i = 0; i < all.length; i += BATCH) batches.push(all.slice(i, i + BATCH));
+      for (let n = 0; n < batches.length && !stop; n++) {
+        setStatus(`Цены: запрос ${n + 1}/${batches.length} (предметов ${withRec.length}, компонентов ${all.length - withRec.length})`);
+        setProgress(n + 1, batches.length);
+        try {
+          rows.push(...await getJSON(`https://${p.server}/api/v2/stats/prices/${batches[n].join(',')}.json?locations=${loc}&qualities=1`));
+        } catch (err) { st.failP = (st.failP || 0) + 1; }
+        await sleep(PAUSE);
+      }
+      if (stop) { setStatus('Остановлено.'); return; }
+
+      const cand = evalCrafts(withRec, recipes, rows, items, p, Date.now(), st);
+      if (!cand.length) { setStatus('Прибыльных крафтов под фильтры нет.\n' + craftFunnelText(st, p)); return; }
+
+      const vols = {}, cids = cand.map(c => c.id), hb = [];
+      for (let i = 0; i < cids.length; i += BATCH_H) hb.push(cids.slice(i, i + BATCH_H));
+      for (let n = 0; n < hb.length && !stop; n++) {
+        setStatus(`Объёмы за 24ч: запрос ${n + 1}/${hb.length}`);
+        setProgress(n + 1, hb.length);
+        try {
+          sumVolumesByCity(await getJSON(`https://${p.server}/api/v2/stats/history/${hb[n].join(',')}?locations=${encodeURIComponent(p.sellCity)}&time-scale=1&qualities=1`), vols, Date.now());
+        } catch (err) { st.failH = (st.failH || 0) + 1; }
+        await sleep(PAUSE);
+      }
+      if (stop) { setStatus('Остановлено.'); return; }
+      cresults = [];
+      for (const c of cand) {
+        c.vol = vols[c.id + '|' + norm(p.sellCity)] || 0;
+        if (c.vol < p.minvol) { st.lowVol = (st.lowVol || 0) + 1; continue; }
+        cresults.push(c);
+      }
+      renderCraft();
+      setStatus(`Готово: найдено ${cresults.length}.` + (namesRu ? '' : ' Русские названия не загрузились, показаны английские.') + '\n' + craftFunnelText(st, p));
+    } catch (err) {
+      setStatus('Ошибка: ' + err.message);
+    } finally {
+      running = false; $('go').disabled = false; $('route').disabled = false; $('craft').disabled = false; $('stop').disabled = true;
+    }
+  }
+
+  $('pgFlip').addEventListener('click', () => { page = 'flip'; applyPage(); });
+  $('pgCraft').addEventListener('click', () => { page = 'craft'; applyPage(); });
+  $('craft').addEventListener('click', scanCraft);
+  $('csort').addEventListener('change', () => renderCraft());
+
   $('go').addEventListener('click', scan);
   $('stop').addEventListener('click', () => { stop = true; });
   $('stop').disabled = true;
+  applyPage();
   $('refresh').addEventListener('click', async () => {
-    localStorage.removeItem('afh-items-ts'); localStorage.removeItem('afh-names-ts'); items = null;
-    try { const c = await caches.open('afh-data'); await c.delete(ITEMS_URL); await c.delete(NAMES_KEY); } catch (e) { /* ignore */ }
+    localStorage.removeItem('afh-items-ts'); localStorage.removeItem('afh-names-ts'); localStorage.removeItem('afh-recipes-ts'); items = null; recipes = null;
+    try { const c = await caches.open('afh-data'); await c.delete(ITEMS_URL); await c.delete(NAMES_KEY); await c.delete(RECIPES_KEY); } catch (e) { /* ignore */ }
     setStatus('Список предметов обновится при следующем скане.');
   });
 
