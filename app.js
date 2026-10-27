@@ -208,6 +208,7 @@ function findOpps(rows, items, p, nowMs, st = {}) {
   const out = [];
   for (const [id, cities] of Object.entries(byItem)) {
     for (const a of CITIES) {
+      if (p.from && a !== p.from) continue;   // режим «из выбранного города»
       const ra = cities[a];
       const buy = (ra && ra.sell_price_min) || 0;
       if (buy <= 0) continue;
@@ -581,13 +582,14 @@ if (typeof document !== 'undefined') {
       await loadItems();
       const ids = buildIdList(items, p);
       if (!ids.length) { setStatus('Под фильтры ничего не подошло.'); return; }
+      p.from = p.city;   // отправная точка — город из фильтров
       const st = { items: ids.length };
       const loc = CITIES.map(encodeURIComponent).join(',');
 
       const rows = [], batches = [];
       for (let i = 0; i < ids.length; i += BATCH) batches.push(ids.slice(i, i + BATCH));
       for (let n = 0; n < batches.length && !stop; n++) {
-        setStatus(`Цены во всех городах: запрос ${n + 1}/${batches.length} (предметов: ${ids.length})`);
+        setStatus(`Цены из ${p.from} и во всех городах: запрос ${n + 1}/${batches.length} (предметов: ${ids.length})`);
         setProgress(n + 1, batches.length);
         try {
           rows.push(...await getJSON(`https://${p.server}/api/v2/stats/prices/${batches[n].join(',')}.json?locations=${loc}&qualities=1`));
@@ -596,7 +598,7 @@ if (typeof document !== 'undefined') {
       }
       if (stop) { setStatus('Остановлено.'); return; }
       const opps = findOpps(rows, items, p, Date.now(), st);
-      if (!opps.length) { setStatus('Выгодных маршрутов под фильтры нет.\n' + funnelRoutesText(st, p)); return; }
+      if (!opps.length) { setStatus(`Выгодных маршрутов из ${p.from} под фильтры нет.\n` + funnelRoutesText(st, p)); return; }
 
       const cand = candidateOpps(opps, p, 40);
       const cids = [...new Set(cand.map(o => o.id))];
@@ -614,7 +616,7 @@ if (typeof document !== 'undefined') {
       const routes = buildRoutes(cand, vols, p, st);
       ranked = rankRoutes(routes, 10);
       render();
-      setStatus(`Готово: маршрутов с прибылью ${routes.length}.` + (namesRu ? '' : ' Русские названия не загрузились, показаны английские.') + '\n' + funnelRoutesText(st, p));
+      setStatus(`Готово: маршрутов из ${p.from} с прибылью: ${routes.length}.` + (namesRu ? '' : ' Русские названия не загрузились, показаны английские.') + '\n' + funnelRoutesText(st, p));
     } catch (err) {
       setStatus('Ошибка: ' + err.message);
     } finally {
